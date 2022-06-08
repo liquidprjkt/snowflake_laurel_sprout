@@ -124,3 +124,11 @@ all.config
 
 # fetched Android config fragments
 kernel/configs/android-*.cfg
+
+# Ignore build stuff
+AnyKernel3/
+build.sh
+clang/
+log.txt
+out/
+regen.sh
