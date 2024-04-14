@@ -811,7 +811,7 @@ CONFIG_ENABLE_MTRACE_LOG := n
 
 >>>>>>> 13557e3ad38a (qcacld: disable debugging bloat as much as possible)
 #Flag to enable nud tracking feature
-CONFIG_WLAN_NUD_TRACKING := n
+CONFIG_WLAN_NUD_TRACKING := y
 
 #Flag to enable/Disable Function call trace
 CONFIG_FUNC_CALL_MAP := n
