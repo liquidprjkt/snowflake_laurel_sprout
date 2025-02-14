@@ -236,14 +236,6 @@ early_param("sched_predl", set_sched_predl);
 __read_mostly unsigned int walt_scale_demand_divisor;
 #define scale_demand(d) ((d)/walt_scale_demand_divisor)
 
-static inline void walt_irq_work_queue(struct irq_work *work)
-{
-	if (likely(cpu_online(raw_smp_processor_id())))
-		irq_work_queue(work);
-	else
-		irq_work_queue_on(work, cpumask_any(cpu_online_mask));
-}
-
 void inc_rq_walt_stats(struct rq *rq, struct task_struct *p)
 {
 	inc_nr_big_task(&rq->walt_stats, p);
@@ -519,6 +511,7 @@ u64 freq_policy_load(struct rq *rq)
 	struct sched_cluster *cluster = rq->cluster;
 	u64 aggr_grp_load = cluster->aggr_grp_load;
 	u64 load, tt_load = 0;
+	u64 coloc_boost_load = cluster->coloc_boost_load;
 
 	if (rq->ed_task != NULL) {
 		load = sched_ravg_window;
@@ -529,6 +522,9 @@ u64 freq_policy_load(struct rq *rq)
 		load = rq->prev_runnable_sum + aggr_grp_load;
 	else
 		load = rq->prev_runnable_sum + rq->grp_time.prev_runnable_sum;
+
+	if (coloc_boost_load)
+		load = max_t(u64, load, coloc_boost_load);
 
 	tt_load = top_task_load(rq);
 	switch (reporting_policy) {
@@ -546,7 +542,9 @@ u64 freq_policy_load(struct rq *rq)
 
 done:
 	trace_sched_load_to_gov(rq, aggr_grp_load, tt_load, sched_freq_aggr_en,
-				load, reporting_policy, walt_rotation_enabled);
+				load, reporting_policy, walt_rotation_enabled,
+				sysctl_sched_little_cluster_coloc_fmin_khz,
+				coloc_boost_load);
 	return load;
 }
 
@@ -879,7 +877,7 @@ void fixup_busy_time(struct task_struct *p, int new_cpu)
 	if (!same_freq_domain(new_cpu, task_cpu(p))) {
 		src_rq->notif_pending = true;
 		dest_rq->notif_pending = true;
-		walt_irq_work_queue(&walt_migration_irq_work);
+		irq_work_queue(&walt_migration_irq_work);
 	}
 
 	if (is_ed_enabled()) {
@@ -1961,7 +1959,7 @@ static inline void run_walt_irq_work(u64 old_window_start, struct rq *rq)
 	result = atomic64_cmpxchg(&walt_irq_work_lastq_ws, old_window_start,
 				   rq->window_start);
 	if (result == old_window_start)
-		walt_irq_work_queue(&walt_cpufreq_irq_work);
+		irq_work_queue(&walt_cpufreq_irq_work);
 }
 
 /* Reflect task activity on its demand and cpu's busy time statistics */
@@ -2337,6 +2335,7 @@ struct sched_cluster init_cluster = {
 	.max_possible_freq	=	1,
 	.exec_scale_factor	=	1024,
 	.aggr_grp_load		=	0,
+	.coloc_boost_load	=	0,
 };
 
 void init_clusters(void)
@@ -3090,21 +3089,69 @@ static void transfer_busy_time(struct rq *rq, struct related_thread_group *grp,
 	BUG_ON((s64)*src_nt_prev_runnable_sum < 0);
 }
 
-bool rtgb_active;
+/* Set to 1GHz by default */
+unsigned int sysctl_sched_little_cluster_coloc_fmin_khz = 1000000;
+static u64 coloc_boost_load;
 
-static bool is_rtgb_active(void)
+void walt_map_freq_to_load(void)
+{
+	struct sched_cluster *cluster;
+
+	for_each_sched_cluster(cluster) {
+		if (is_min_capacity_cluster(cluster)) {
+			int fcpu = cluster_first_cpu(cluster);
+
+			coloc_boost_load = div64_u64(
+				((u64)sched_ravg_window *
+				arch_scale_cpu_capacity(NULL, fcpu) *
+				sysctl_sched_little_cluster_coloc_fmin_khz),
+				(u64)1024 * cpu_max_possible_freq(fcpu));
+			coloc_boost_load = div64_u64(coloc_boost_load << 2, 5);
+			break;
+		}
+	}
+}
+
+static void walt_update_coloc_boost_load(void)
 {
 	struct related_thread_group *grp;
+	struct sched_cluster *cluster;
 
-	if (sched_boost() == CONSERVATIVE_BOOST)
-		return false;
+	if (!sysctl_sched_little_cluster_coloc_fmin_khz ||
+			sched_boost() == CONSERVATIVE_BOOST)
+		return;
 
 	grp = lookup_related_thread_group(DEFAULT_CGROUP_COLOC_ID);
 	if (!grp || !grp->preferred_cluster ||
 			is_min_capacity_cluster(grp->preferred_cluster))
-		return false;
+		return;
 
-	return true;
+	for_each_sched_cluster(cluster) {
+		if (is_min_capacity_cluster(cluster)) {
+			cluster->coloc_boost_load = coloc_boost_load;
+			break;
+		}
+	}
+}
+
+int sched_little_cluster_coloc_fmin_khz_handler(struct ctl_table *table,
+				int write, void __user *buffer, size_t *lenp,
+				loff_t *ppos)
+{
+	int ret;
+	static DEFINE_MUTEX(mutex);
+
+	mutex_lock(&mutex);
+
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (ret || !write)
+		goto done;
+
+	walt_map_freq_to_load();
+
+done:
+	mutex_unlock(&mutex);
+	return ret;
 }
 
 /*
@@ -3152,22 +3199,13 @@ void walt_irq_work(struct irq_work *irq_work)
 
 		cluster->aggr_grp_load = aggr_grp_load;
 		total_grp_load += aggr_grp_load;
+		cluster->coloc_boost_load = 0;
 
 		raw_spin_unlock(&cluster->load_lock);
 	}
 
-	if (total_grp_load) {
-		if (cpumask_weight(&asym_cap_sibling_cpus)) {
-			u64 big_grp_load =
-					  total_grp_load - min_cluster_grp_load;
-
-			for_each_cpu(cpu, &asym_cap_sibling_cpus)
-				cpu_cluster(cpu)->aggr_grp_load = big_grp_load;
-		}
-		rtgb_active = is_rtgb_active();
-	} else {
-		rtgb_active = false;
-	}
+	if (total_grp_load)
+		walt_update_coloc_boost_load();
 
 	for_each_sched_cluster(cluster) {
 		cpumask_t cluster_online_cpus;
